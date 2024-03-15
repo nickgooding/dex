@@ -6,15 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/exp/slices"
 	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
 	admin "google.golang.org/api/admin/directory/v1"
+	"google.golang.org/api/impersonate"
 	"google.golang.org/api/option"
 
 	"github.com/dexidp/dex/connector"
@@ -95,9 +94,9 @@ func (c *Config) Open(id string, logger log.Logger) (conn connector.Connector, e
 	}
 
 	// Fixing a regression caused by default config fallback: https://github.com/dexidp/dex/issues/2699
-	if (c.ServiceAccountFilePath != "" && len(c.DomainToAdminEmail) > 0) || slices.Contains(scopes, "groups") {
+	if slices.Contains(scopes, "groups") {
 		for domain, adminEmail := range c.DomainToAdminEmail {
-			srv, err := createDirectoryService(c.ServiceAccountFilePath, adminEmail, logger)
+			srv, err := createDirectoryService(c.ServiceAccountFilePath, adminEmail)
 			if err != nil {
 				cancel()
 				return nil, fmt.Errorf("could not create directory service: %v", err)
@@ -353,33 +352,26 @@ func (c *googleConnector) extractDomainFromEmail(email string) string {
 // createDirectoryService sets up super user impersonation and creates an admin client for calling
 // the google admin api. If no serviceAccountFilePath is defined, the application default credential
 // is used.
-func createDirectoryService(serviceAccountFilePath, email string, logger log.Logger) (*admin.Service, error) {
-	var jsonCredentials []byte
-	var err error
-
+func createDirectoryService(serviceAccountFilePath, email string) (*admin.Service, error) {
 	ctx := context.Background()
-	if serviceAccountFilePath == "" {
-		logger.Warn("the application default credential is used since the service account file path is not used")
-		credential, err := google.FindDefaultCredentials(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch application default credentials: %w", err)
-		}
-		jsonCredentials = credential.JSON
-	} else {
-		jsonCredentials, err = os.ReadFile(serviceAccountFilePath)
-		if err != nil {
-			return nil, fmt.Errorf("error reading credentials from file: %v", err)
-		}
-	}
-	config, err := google.JWTConfigFromJSON(jsonCredentials, admin.AdminDirectoryGroupReadonlyScope)
-	if err != nil {
-		return nil, fmt.Errorf("unable to parse client secret file to config: %v", err)
+	var opts []option.ClientOption
+
+	if serviceAccountFilePath != "" {
+		opts = append(opts, option.WithCredentialsFile(serviceAccountFilePath))
 	}
 
 	// Only attempt impersonation when there is a user configured
 	if email != "" {
-		config.Subject = email
+		config := impersonate.CredentialsConfig{
+			TargetPrincipal: email,
+			Scopes:          []string{admin.AdminDirectoryGroupReadonlyScope},
+		}
+		tokenSource, err := impersonate.CredentialsTokenSource(ctx, config, opts...)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create token source for impersonation: %v", err)
+		}
+		opts = []option.ClientOption{option.WithTokenSource(tokenSource)}
 	}
 
-	return admin.NewService(ctx, option.WithHTTPClient(config.Client(ctx)))
+	return admin.NewService(ctx, opts...)
 }
